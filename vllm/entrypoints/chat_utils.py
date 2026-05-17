@@ -68,6 +68,29 @@ else:
 logger = init_logger(__name__)
 
 
+def _summarize_mm_object(obj: object) -> str:
+    if obj is None:
+        return "None"
+
+    summary = [f"type={type(obj).__name__}"]
+    for attr in ("size", "mode", "format", "shape", "dtype"):
+        value = getattr(obj, attr, None)
+        if value is not None:
+            summary.append(f"{attr}={value}")
+
+    return ", ".join(summary)
+
+
+def _summarize_mm_sequence(values: list[object]) -> str:
+    if not values:
+        return "count=0"
+
+    return "count=%d, first=(%s)" % (
+        len(values),
+        _summarize_mm_object(values[0]),
+    )
+
+
 def __getattr__(name: str):
     if name == "resolve_hf_chat_template":
         from vllm.renderers.hf import resolve_chat_template
@@ -655,6 +678,11 @@ def _resolve_items(
     if "image" in items_by_modality:
         mm_data["image"] = [data for data, uuid in items_by_modality["image"]]
         mm_uuids["image"] = [uuid for data, uuid in items_by_modality["image"]]
+        logger.info(
+            "[MM] Resolved image data before prompt rendering: %s, uuids=%s",
+            _summarize_mm_sequence(mm_data["image"]),
+            mm_uuids["image"],
+        )
     if "audio_embeds" in items_by_modality:
         mm_data["audio"] = _get_embeds_data(
             "audio",
@@ -811,6 +839,13 @@ class MultiModalContentParser(BaseMultiModalContentParser):
 
     def parse_image(self, image_url: str | None, uuid: str | None = None) -> None:
         image = self._connector.fetch_image(image_url) if image_url else None
+        logger.info(
+            "[MM] Fetched image before prompt rendering: url_provided=%s, "
+            "uuid=%s, image=(%s)",
+            image_url is not None,
+            uuid,
+            _summarize_mm_object(image),
+        )
 
         placeholder = self._tracker.add("image", (image, uuid))
         self._add_placeholder("image", placeholder)
@@ -936,6 +971,13 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
     async def _image_with_uuid_async(self, image_url: str | None, uuid: str | None):
         image = (
             await self._connector.fetch_image_async(image_url) if image_url else None
+        )
+        logger.info(
+            "[MM] Fetched image before prompt rendering: url_provided=%s, "
+            "uuid=%s, image=(%s)",
+            image_url is not None,
+            uuid,
+            _summarize_mm_object(image),
         )
         return image, uuid
 

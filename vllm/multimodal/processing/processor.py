@@ -59,6 +59,26 @@ else:
 
 logger = init_logger(__name__)
 
+
+def _summarize_processor_data(data: Mapping[str, object]) -> str:
+    summary = []
+    for key, value in data.items():
+        value_summary = f"type={type(value).__name__}"
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            value_summary += f", len={len(value)}"
+            if len(value) > 0:
+                first = value[0]
+                value_summary += f", first_type={type(first).__name__}"
+                size = getattr(first, "size", None)
+                if size is not None:
+                    value_summary += f", first_size={size}"
+        elif hasattr(value, "shape"):
+            value_summary += f", shape={getattr(value, 'shape')}"
+        summary.append(f"{key}=({value_summary})")
+
+    return "; ".join(summary)
+
+
 _S = TypeVar("_S", str, list[int])
 
 
@@ -1149,6 +1169,16 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             {k for k, c in mm_items.get_all_counts().items() if c > 0}
         )
         processor_data, passthrough_data = self._get_hf_mm_data(valid_mm_items)
+        logger.info(
+            "[MM] Before HF processor/tokenizer: prompt_len=%d, prompt=%r, "
+            "processor_data=%s, hf_processor_mm_kwargs=%s, "
+            "tokenization_kwargs=%s",
+            len(prompt_text),
+            prompt_text,
+            _summarize_processor_data(processor_data),
+            hf_processor_mm_kwargs,
+            tokenization_kwargs,
+        )
 
         processed_data = self._call_hf_processor(
             prompt=prompt_text,
@@ -1163,6 +1193,13 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             input_ids = input_ids.tolist()
 
         (prompt_ids,) = input_ids
+        logger.info(
+            "[MM] After HF processor/tokenizer: prompt_token_count=%d, "
+            "prompt_token_ids_first_50=%s, processed_data_keys=%s",
+            len(prompt_ids),
+            prompt_ids[:50],
+            list(processed_data.keys()),
+        )
 
         is_update_applied = self._hf_processor_applies_updates(
             prompt_text=prompt_text,

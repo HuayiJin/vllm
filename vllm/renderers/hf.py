@@ -41,6 +41,37 @@ from .params import ChatParams
 logger = init_logger(__name__)
 
 
+def _summarize_prompt_raw(prompt_raw: str | list[int]) -> str:
+    if isinstance(prompt_raw, str):
+        return "type=str, len=%d, value=%r" % (len(prompt_raw), prompt_raw)
+
+    return "type=list[int], len=%d, first_50=%s" % (
+        len(prompt_raw),
+        prompt_raw[:50],
+    )
+
+
+def _summarize_mm_data(mm_data: MultiModalDataDict | None) -> str:
+    if mm_data is None:
+        return "None"
+
+    summary = []
+    for modality, values in mm_data.items():
+        if isinstance(values, list):
+            first = values[0] if values else None
+            first_summary = "None" if first is None else type(first).__name__
+            size = getattr(first, "size", None)
+            if size is not None:
+                first_summary = f"{first_summary}, size={size}"
+            summary.append(
+                f"{modality}: count={len(values)}, first=({first_summary})"
+            )
+        else:
+            summary.append(f"{modality}: type={type(values).__name__}")
+
+    return "; ".join(summary)
+
+
 _PROCESSOR_CHAT_TEMPLATES = dict[tuple[str, bool], str | None]()
 """
 Used in `_try_get_processor_chat_template` to avoid calling
@@ -641,11 +672,23 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
+        logger.info(
+            "[MM] Parsed chat messages before chat template: "
+            "conversation_len=%d, mm_data=%s, mm_uuids=%s",
+            len(conversation),
+            _summarize_mm_data(mm_data),
+            mm_uuids,
+        )
+
         prompt_raw = safe_apply_chat_template(
             model_config,
             tokenizer,
             conversation,
             **params.get_apply_chat_template_kwargs(),
+        )
+        logger.info(
+            "[MM] Rendered prompt before tokenizer: %s",
+            _summarize_prompt_raw(prompt_raw),
         )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
@@ -676,6 +719,14 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
         if mm_uuids is not None:
             prompt["multi_modal_uuids"] = mm_uuids
 
+        logger.info(
+            "[MM] Prompt dict before engine processing: keys=%s, mm_data=%s",
+            list(prompt.keys()),
+            _summarize_mm_data(
+                cast(MultiModalDataDict | None, prompt.get("multi_modal_data"))
+            ),
+        )
+
         return conversation, prompt
 
     async def render_messages_async(
@@ -700,11 +751,23 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             mm_processor_kwargs=params.mm_processor_kwargs,
         )
 
+        logger.info(
+            "[MM] Parsed chat messages before chat template: "
+            "conversation_len=%d, mm_data=%s, mm_uuids=%s",
+            len(conversation),
+            _summarize_mm_data(mm_data),
+            mm_uuids,
+        )
+
         prompt_raw = await self._apply_chat_template_async(
             model_config,
             tokenizer,
             conversation,
             **params.get_apply_chat_template_kwargs(),
+        )
+        logger.info(
+            "[MM] Rendered prompt before tokenizer: %s",
+            _summarize_prompt_raw(prompt_raw),
         )
 
         # NOTE: use_unified_vision_chunk is currently specific to Kimi-K2.5
@@ -732,5 +795,13 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
             prompt["multi_modal_data"] = mm_data
         if mm_uuids is not None:
             prompt["multi_modal_uuids"] = mm_uuids
+
+        logger.info(
+            "[MM] Prompt dict before engine processing: keys=%s, mm_data=%s",
+            list(prompt.keys()),
+            _summarize_mm_data(
+                cast(MultiModalDataDict | None, prompt.get("multi_modal_data"))
+            ),
+        )
 
         return conversation, prompt
