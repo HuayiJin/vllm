@@ -284,5 +284,5 @@ if [[ "$WATCHDOG_ENABLE" == "1" ]]; then
   start_vllm "$@"
   watchdog_loop "$@"
 else
-  exec vllm_cmd "$@"
+  vllm_cmd "$@"
 fi
