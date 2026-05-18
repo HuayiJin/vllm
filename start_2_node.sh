@@ -115,6 +115,7 @@ vllm_cmd() {
     --max-long-partial-prefills 1 \
     --long-prefill-token-threshold "$VLLM_LONG_PREFILL_TOKEN_THRESHOLD" \
     --mm-processor-cache-gb "$VLLM_MM_PROCESSOR_CACHE_GB" \
+    --trust-remote-code \
     "$@"
 }
 
@@ -272,6 +273,12 @@ cleanup() {
   stop_vllm
 }
 trap cleanup EXIT INT TERM
+
+# Worker nodes don't expose an API endpoint, skip watchdog
+if [[ "$RANK" != "0" ]]; then
+  log "node-rank=$RANK (worker): watchdog disabled"
+  WATCHDOG_ENABLE=0
+fi
 
 if [[ "$WATCHDOG_ENABLE" == "1" ]]; then
   start_vllm "$@"
