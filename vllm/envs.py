@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     VLLM_MEDIA_CACHE_MAX_SIZE_MB: int = 5120
     VLLM_MEDIA_CACHE_TTL_HOURS: float = 24
     VLLM_MEDIA_FETCH_MAX_RETRIES: int = 3
+    VLLM_MEDIA_LOADING_BEST_EFFORT: bool = False
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
@@ -811,6 +812,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # from URLs. Each retry quadruples the timeout. Default is 3.
     "VLLM_MEDIA_FETCH_MAX_RETRIES": lambda: int(
         os.getenv("VLLM_MEDIA_FETCH_MAX_RETRIES", "3")
+    ),
+    # If set to 1, enable best-effort media loading: when an image fails to
+    # download (e.g. timeout) or cannot be decoded, the request will not be
+    # aborted. Instead, a blank placeholder image is substituted so the
+    # number of multimodal placeholders still matches the number of images
+    # and the request can continue with the remaining content.
+    # WARNING: the model will "see" a blank image in place of the failed one,
+    # which may degrade output quality. Default is 0 (disabled, fail-closed).
+    "VLLM_MEDIA_LOADING_BEST_EFFORT": lambda: bool(
+        int(os.getenv("VLLM_MEDIA_LOADING_BEST_EFFORT", "0"))
     ),
     # Whether to allow HTTP redirects when fetching from media URLs.
     # Default to True

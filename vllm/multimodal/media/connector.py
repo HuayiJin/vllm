@@ -9,6 +9,7 @@ import os
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.request import url2pathname
@@ -30,6 +31,128 @@ from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoMediaIO
 
 logger = init_logger(__name__)
+
+
+def _build_placeholder_image_bytes() -> bytes:
+    """Encode a small blank RGB image as PNG bytes.
+
+    Used as a fallback when ``VLLM_MEDIA_LOADING_BEST_EFFORT`` is enabled and
+    an image fails to download or decode. Substituting a valid placeholder
+    (instead of dropping the item) keeps the number of multimodal placeholders
+    in the prompt matched with the number of images, so the request can still
+    be processed by the downstream multimodal processor.
+    """
+    with BytesIO() as buffer:
+        Image.new("RGB", (32, 32), (0, 0, 0)).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+# Encoded once at import time; decoding back to a PIL image is cheap.
+_PLACEHOLDER_IMAGE_BYTES = _build_placeholder_image_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics for media fetching (image / audio / video).
+#
+# Registered at import time and exposed via the same /metrics endpoint served by
+# the API server (PROMETHEUS_MULTIPROC_DIR aware; see
+# vllm.v1.metrics.prometheus.get_prometheus_registry). They measure the latency
+# of MediaConnector.load_from_url[_async], which covers:
+#   - HTTP GET (external / object-storage downloads)
+#   - base64 / data-URL decoding
+#   - file:// reading
+#   - media bytes -> tensor/PIL decoding (media_io.load_bytes)
+#
+# Labels:
+#   modality : image | audio | video | unknown
+#   source   : http | http_cached | data | file | unknown
+#   status   : success | error  (latency only)
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter as _PromCounter
+    from prometheus_client import Histogram as _PromHistogram
+
+    _MM_FETCH_LATENCY_BUCKETS = (
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75,
+        1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
+    )
+    _MM_FETCH_LATENCY = _PromHistogram(
+        "vllm:mm_fetch_seconds",
+        "Latency of MediaConnector.load_from_url[_async] (image/audio/video). "
+        "Covers HTTP GET, base64/file decoding and media_io.load_bytes.",
+        labelnames=("modality", "source", "status"),
+        buckets=_MM_FETCH_LATENCY_BUCKETS,
+    )
+    _MM_FETCH_BYTES = _PromHistogram(
+        "vllm:mm_fetch_bytes",
+        "Size (in bytes) of media payload fetched by MediaConnector. "
+        "Only populated when the raw byte length is known "
+        "(http/http_cached/data sources).",
+        labelnames=("modality", "source"),
+        buckets=(
+            1024,            # 1 KB
+            10 * 1024,       # 10 KB
+            100 * 1024,      # 100 KB
+            512 * 1024,      # 512 KB
+            1024 * 1024,     # 1 MB
+            5 * 1024 * 1024,
+            10 * 1024 * 1024,
+            50 * 1024 * 1024,
+            100 * 1024 * 1024,
+        ),
+    )
+    _MM_FETCH_ERRORS = _PromCounter(
+        "vllm:mm_fetch_errors",
+        "Number of MediaConnector fetch failures (timeouts, decode errors, "
+        "disallowed domains, etc.) split by modality/source.",
+        labelnames=("modality", "source"),
+    )
+except Exception:  # pragma: no cover - be defensive if prometheus is absent
+    _MM_FETCH_LATENCY = None
+    _MM_FETCH_BYTES = None
+    _MM_FETCH_ERRORS = None
+
+
+def _modality_of(media_io: "MediaIO") -> str:
+    """Best-effort mapping from a MediaIO instance to a modality label."""
+    if isinstance(media_io, VideoMediaIO):
+        return "video"
+    if isinstance(media_io, ImageMediaIO):
+        return "image"
+    if isinstance(media_io, AudioMediaIO):
+        return "audio"
+    return "unknown"
+
+
+def _source_of(scheme: str | None, cached_hit: bool = False) -> str:
+    if scheme and scheme.startswith("http"):
+        return "http_cached" if cached_hit else "http"
+    if scheme == "data":
+        return "data"
+    if scheme == "file":
+        return "file"
+    return "unknown"
+
+
+def _observe_mm_fetch(
+    modality: str,
+    source: str,
+    elapsed: float,
+    status: str,
+    nbytes: int | None = None,
+) -> None:
+    if _MM_FETCH_LATENCY is not None:
+        _MM_FETCH_LATENCY.labels(modality, source, status).observe(elapsed)
+    if status == "error" and _MM_FETCH_ERRORS is not None:
+        _MM_FETCH_ERRORS.labels(modality, source).inc()
+    if (
+        nbytes is not None
+        and nbytes >= 0
+        and status == "success"
+        and _MM_FETCH_BYTES is not None
+    ):
+        _MM_FETCH_BYTES.labels(modality, source).observe(nbytes)
+
 
 _M = TypeVar("_M")
 
@@ -291,32 +414,51 @@ class MediaConnector:
         fetch_timeout: int | None = None,
     ) -> _M:  # type: ignore[type-var]
         url_spec = parse_url(url)
+        modality = _modality_of(media_io)
+        source = _source_of(url_spec.scheme)
+        nbytes: int | None = None
+        start = time.perf_counter()
+        status = "success"
+        try:
+            if url_spec.scheme and url_spec.scheme.startswith("http"):
+                self._assert_url_in_allowed_media_domains(url_spec)
 
-        if url_spec.scheme and url_spec.scheme.startswith("http"):
-            self._assert_url_in_allowed_media_domains(url_spec)
+                cached = self._get_cached_bytes(url)
+                if cached is not None:
+                    source = "http_cached"
+                    nbytes = len(cached)
+                    return media_io.load_bytes(cached)
 
-            cached = self._get_cached_bytes(url)
-            if cached is not None:
-                return media_io.load_bytes(cached)
+                connection = self.connection
+                data = connection.get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
 
-            connection = self.connection
-            data = connection.get_bytes(
-                url_spec.url,
-                timeout=fetch_timeout,
-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                self._put_cached_bytes(url, data)
+                nbytes = len(data)
+                return media_io.load_bytes(data)
+
+            if url_spec.scheme == "data":
+                return self._load_data_url(url_spec, media_io)
+
+            if url_spec.scheme == "file":
+                return self._load_file_url(url_spec, media_io)
+
+            msg = "The URL must be either a HTTP, data or file URL."
+            raise ValueError(msg)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            _observe_mm_fetch(
+                modality,
+                source,
+                time.perf_counter() - start,
+                status,
+                nbytes,
             )
-
-            self._put_cached_bytes(url, data)
-            return media_io.load_bytes(data)
-
-        if url_spec.scheme == "data":
-            return self._load_data_url(url_spec, media_io)
-
-        if url_spec.scheme == "file":
-            return self._load_file_url(url_spec, media_io)
-
-        msg = "The URL must be either a HTTP, data or file URL."
-        raise ValueError(msg)
 
     async def load_from_url_async(
         self,
@@ -327,45 +469,66 @@ class MediaConnector:
     ) -> _M:
         url_spec = parse_url(url)
         loop = asyncio.get_running_loop()
+        modality = _modality_of(media_io)
+        source = _source_of(url_spec.scheme)
+        nbytes: int | None = None
+        start = time.perf_counter()
+        status = "success"
+        try:
+            if url_spec.scheme and url_spec.scheme.startswith("http"):
+                self._assert_url_in_allowed_media_domains(url_spec)
 
-        if url_spec.scheme and url_spec.scheme.startswith("http"):
-            self._assert_url_in_allowed_media_domains(url_spec)
+                cached = await loop.run_in_executor(
+                    global_thread_pool, self._get_cached_bytes, url
+                )
+                if cached is not None:
+                    source = "http_cached"
+                    nbytes = len(cached)
+                    future = loop.run_in_executor(
+                        global_thread_pool, media_io.load_bytes, cached
+                    )
+                    return await future
 
-            cached = await loop.run_in_executor(
-                global_thread_pool, self._get_cached_bytes, url
-            )
-            if cached is not None:
+                connection = self.connection
+                data = await connection.async_get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                )
+
+                await loop.run_in_executor(
+                    global_thread_pool, self._put_cached_bytes, url, data
+                )
+                nbytes = len(data)
                 future = loop.run_in_executor(
-                    global_thread_pool, media_io.load_bytes, cached
+                    global_thread_pool, media_io.load_bytes, data
                 )
                 return await future
 
-            connection = self.connection
-            data = await connection.async_get_bytes(
-                url_spec.url,
-                timeout=fetch_timeout,
-                allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
-            )
+            if url_spec.scheme == "data":
+                future = loop.run_in_executor(
+                    global_thread_pool, self._load_data_url, url_spec, media_io
+                )
+                return await future
 
-            await loop.run_in_executor(
-                global_thread_pool, self._put_cached_bytes, url, data
+            if url_spec.scheme == "file":
+                future = loop.run_in_executor(
+                    global_thread_pool, self._load_file_url, url_spec, media_io
+                )
+                return await future
+            msg = "The URL must be either a HTTP, data or file URL."
+            raise ValueError(msg)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            _observe_mm_fetch(
+                modality,
+                source,
+                time.perf_counter() - start,
+                status,
+                nbytes,
             )
-            future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
-            return await future
-
-        if url_spec.scheme == "data":
-            future = loop.run_in_executor(
-                global_thread_pool, self._load_data_url, url_spec, media_io
-            )
-            return await future
-
-        if url_spec.scheme == "file":
-            future = loop.run_in_executor(
-                global_thread_pool, self._load_file_url, url_spec, media_io
-            )
-            return await future
-        msg = "The URL must be either a HTTP, data or file URL."
-        raise ValueError(msg)
 
     def fetch_audio(
         self,
@@ -419,8 +582,14 @@ class MediaConnector:
                 fetch_timeout=envs.VLLM_IMAGE_FETCH_TIMEOUT,
             )
         except UnidentifiedImageError as e:
+            if envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                return self._placeholder_image(image_url, image_io, e)
             # convert to ValueError to be properly caught upstream
             raise ValueError(str(e)) from e
+        except Exception as e:
+            if not envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                raise
+            return self._placeholder_image(image_url, image_io, e)
 
     async def fetch_image_async(
         self,
@@ -444,8 +613,36 @@ class MediaConnector:
                 fetch_timeout=envs.VLLM_IMAGE_FETCH_TIMEOUT,
             )
         except UnidentifiedImageError as e:
+            if envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                return self._placeholder_image(image_url, image_io, e)
             # convert to ValueError to be properly caught upstream
             raise ValueError(str(e)) from e
+        except Exception as e:
+            if not envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                raise
+            return self._placeholder_image(image_url, image_io, e)
+
+    def _placeholder_image(
+        self,
+        image_url: str,
+        image_io: ImageMediaIO,
+        exc: Exception,
+    ) -> Image.Image:
+        """Return a blank placeholder image for a failed image load.
+
+        Only used when ``VLLM_MEDIA_LOADING_BEST_EFFORT`` is enabled. Returning
+        a valid placeholder (instead of dropping the item) keeps the number of
+        multimodal placeholders matched with the number of images, so the
+        request can continue with the remaining content.
+        """
+        logger.warning(
+            "Failed to load image from %s; best-effort media loading is "
+            "enabled, substituting a blank placeholder image so the "
+            "request can continue: %s",
+            image_url,
+            exc,
+        )
+        return image_io.load_bytes(_PLACEHOLDER_IMAGE_BYTES)
 
     def fetch_video(
         self,
