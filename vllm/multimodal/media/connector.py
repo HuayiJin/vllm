@@ -9,6 +9,7 @@ import os
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.request import url2pathname
@@ -17,6 +18,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 from PIL import Image, UnidentifiedImageError
+from prometheus_client import Counter, Histogram
 from urllib3.util import Url, parse_url
 
 import vllm.envs as envs
@@ -30,6 +32,69 @@ from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoMediaIO
 
 logger = init_logger(__name__)
+
+
+def _build_placeholder_image_bytes() -> bytes:
+    """Encode a 1x1 blank (white) RGB image as PNG bytes.
+
+    Used as a fallback when ``VLLM_MEDIA_LOADING_BEST_EFFORT`` is enabled and an
+    image fails to download or decode. Substituting a valid placeholder (instead
+    of dropping the item) keeps the number of multimodal placeholders matched
+    with the number of images, so the request can still be processed by the
+    downstream multimodal processor and chat templates (e.g. qwen-vl).
+    """
+    with BytesIO() as buffer:
+        Image.new("RGB", (1, 1), (255, 255, 255)).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+
+# Encoded once at import time; decoding back to a PIL image is cheap.
+_PLACEHOLDER_IMAGE_BYTES = _build_placeholder_image_bytes()
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics for image fetching. Exposed on the same /metrics endpoint
+# as the rest of vLLM (``vllm:`` prefix, scrapeable by Grafana). They are
+# registered in the API server frontend process, which is where MediaConnector
+# (and thus the image download) runs.
+#   domain : image source host (or "data" / "file" / "unknown")
+#   status : success | error
+# Failure rate per domain can be derived from vllm:mm_image_fetch_total as
+#   error / (success + error).
+# ---------------------------------------------------------------------------
+_IMAGE_FETCH_DURATION = Histogram(
+    "vllm:mm_image_fetch_duration_seconds",
+    "Duration of fetching an image (download + decode) via MediaConnector, "
+    "labeled by source domain and status.",
+    labelnames=("domain", "status"),
+    buckets=(0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0),
+)
+_IMAGE_FETCH_TOTAL = Counter(
+    "vllm:mm_image_fetch_total",
+    "Total image fetch attempts via MediaConnector, split by source domain "
+    "and status (success/error).",
+    labelnames=("domain", "status"),
+)
+
+
+def _image_fetch_domain(url: str) -> str:
+    """Best-effort extraction of the source domain for metric labels."""
+    if url.startswith("data:"):
+        return "data"
+    try:
+        url_spec = parse_url(url)
+    except Exception:
+        return "unknown"
+    if url_spec.scheme == "file":
+        return "file"
+    return url_spec.hostname or "unknown"
+
+
+def _observe_image_fetch(domain: str, elapsed: float, status: str) -> None:
+    """Record latency and success/error count for a single image fetch."""
+    _IMAGE_FETCH_TOTAL.labels(domain, status).inc()
+    _IMAGE_FETCH_DURATION.labels(domain, status).observe(elapsed)
+
 
 _M = TypeVar("_M")
 
@@ -407,11 +472,19 @@ class MediaConnector:
         Load a PIL image from an HTTP or base64 data URL.
 
         By default, the image is converted into RGB format.
+
+        Emits ``vllm:mm_image_fetch_*`` metrics (latency + success/error count)
+        labeled by source domain. When ``VLLM_MEDIA_LOADING_BEST_EFFORT`` is
+        enabled, a download/decode failure returns a 1x1 blank placeholder image
+        instead of raising, so the request can continue.
         """
         image_io = ImageMediaIO(
             image_mode=image_mode, **self.media_io_kwargs.get("image", {})
         )
 
+        domain = _image_fetch_domain(image_url)
+        start = time.perf_counter()
+        status = "success"
         try:
             return self.load_from_url(
                 image_url,
@@ -419,8 +492,18 @@ class MediaConnector:
                 fetch_timeout=envs.VLLM_IMAGE_FETCH_TIMEOUT,
             )
         except UnidentifiedImageError as e:
+            status = "error"
+            if envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                return self._placeholder_image(image_url, image_io, e)
             # convert to ValueError to be properly caught upstream
             raise ValueError(str(e)) from e
+        except Exception as e:
+            status = "error"
+            if envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                return self._placeholder_image(image_url, image_io, e)
+            raise
+        finally:
+            _observe_image_fetch(domain, time.perf_counter() - start, status)
 
     async def fetch_image_async(
         self,
@@ -432,11 +515,17 @@ class MediaConnector:
         Asynchronously load a PIL image from an HTTP or base64 data URL.
 
         By default, the image is converted into RGB format.
+
+        See :meth:`fetch_image` for the emitted metrics and the best-effort
+        placeholder behavior controlled by ``VLLM_MEDIA_LOADING_BEST_EFFORT``.
         """
         image_io = ImageMediaIO(
             image_mode=image_mode, **self.media_io_kwargs.get("image", {})
         )
 
+        domain = _image_fetch_domain(image_url)
+        start = time.perf_counter()
+        status = "success"
         try:
             return await self.load_from_url_async(
                 image_url,
@@ -444,8 +533,42 @@ class MediaConnector:
                 fetch_timeout=envs.VLLM_IMAGE_FETCH_TIMEOUT,
             )
         except UnidentifiedImageError as e:
+            status = "error"
+            if envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                return self._placeholder_image(image_url, image_io, e)
             # convert to ValueError to be properly caught upstream
             raise ValueError(str(e)) from e
+        except Exception as e:
+            status = "error"
+            if envs.VLLM_MEDIA_LOADING_BEST_EFFORT:
+                return self._placeholder_image(image_url, image_io, e)
+            raise
+        finally:
+            _observe_image_fetch(domain, time.perf_counter() - start, status)
+
+    def _placeholder_image(
+        self,
+        image_url: str,
+        image_io: ImageMediaIO,
+        exc: Exception,
+    ) -> Image.Image:
+        """Return a 1x1 blank placeholder image for a failed image load.
+
+        Only used when ``VLLM_MEDIA_LOADING_BEST_EFFORT`` is enabled. Returning a
+        valid placeholder (instead of dropping the item) keeps the number of
+        multimodal placeholders matched with the number of images, so the
+        request can continue without breaking chat-template placeholder
+        validation (e.g. qwen-vl).
+        """
+        url_preview = image_url if len(image_url) <= 100 else f"{image_url[:100]}..."
+        logger.warning(
+            "Failed to fetch image from %s; VLLM_MEDIA_LOADING_BEST_EFFORT is "
+            "enabled, substituting a 1x1 blank placeholder image so the request "
+            "can continue: %s",
+            url_preview,
+            exc,
+        )
+        return image_io.load_bytes(_PLACEHOLDER_IMAGE_BYTES)
 
     def fetch_video(
         self,

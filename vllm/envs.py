@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     VLLM_MEDIA_FETCH_MAX_RETRIES: int = 3
     VLLM_MEDIA_URL_ALLOW_REDIRECTS: bool = True
     VLLM_MEDIA_LOADING_THREAD_COUNT: int = 8
+    VLLM_MEDIA_LOADING_BEST_EFFORT: bool = False
     VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: int = 25
     VLLM_VIDEO_LOADER_BACKEND: str = "opencv"
     VLLM_MEDIA_CONNECTOR: str = "http"
@@ -836,6 +837,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default is 8
     "VLLM_MEDIA_LOADING_THREAD_COUNT": lambda: int(
         os.getenv("VLLM_MEDIA_LOADING_THREAD_COUNT", "8")
+    ),
+    # If set to 1, enable best-effort image loading: when an image fails to
+    # download (e.g. timeout) or decode, the request is not aborted. Instead a
+    # 1x1 blank placeholder image is substituted so the number of multimodal
+    # placeholders still matches the number of images and inference can
+    # continue. Default is 0 (disabled, fail-closed).
+    "VLLM_MEDIA_LOADING_BEST_EFFORT": lambda: bool(
+        int(os.getenv("VLLM_MEDIA_LOADING_BEST_EFFORT", "0"))
     ),
     # Maximum filesize in MB for a single audio file when processing
     # speech-to-text requests. Files larger than this will be rejected.
@@ -1880,6 +1889,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_MEDIA_FETCH_MAX_RETRIES",
         "VLLM_MEDIA_URL_ALLOW_REDIRECTS",
         "VLLM_MEDIA_LOADING_THREAD_COUNT",
+        "VLLM_MEDIA_LOADING_BEST_EFFORT",
         "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB",
         "VLLM_VIDEO_LOADER_BACKEND",
         "VLLM_MEDIA_CONNECTOR",
