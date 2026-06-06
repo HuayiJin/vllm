@@ -62,19 +62,38 @@ _PLACEHOLDER_IMAGE_BYTES = _build_placeholder_image_bytes()
 # Failure rate per domain can be derived from vllm:mm_image_fetch_total as
 #   error / (success + error).
 # ---------------------------------------------------------------------------
-_IMAGE_FETCH_DURATION = Histogram(
-    "vllm:mm_image_fetch_duration_seconds",
-    "Duration of fetching an image (download + decode) via MediaConnector, "
-    "labeled by source domain and status.",
-    labelnames=("domain", "status"),
-    buckets=(0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0),
-)
-_IMAGE_FETCH_TOTAL = Counter(
-    "vllm:mm_image_fetch_total",
-    "Total image fetch attempts via MediaConnector, split by source domain "
-    "and status (success/error).",
-    labelnames=("domain", "status"),
-)
+# NOTE: These metrics are created lazily (on first observation) rather than at
+# import time. ``vllm.v1.metrics.prometheus.unregister_vllm_metrics()`` (called
+# from ``PrometheusStatLogger.__init__``) unregisters *every* collector whose
+# name contains "vllm" from the global REGISTRY during engine startup. Since
+# these metrics are named ``vllm:mm_image_fetch_*``, registering them at import
+# time would get them silently removed before any request is served, so they
+# would never appear on ``/metrics``. Creating them lazily ensures registration
+# happens after that cleanup has run.
+_IMAGE_FETCH_DURATION: Histogram | None = None
+_IMAGE_FETCH_TOTAL: Counter | None = None
+
+
+def _get_image_fetch_metrics() -> tuple[Histogram, Counter]:
+    """Lazily create and return the (duration, total) image-fetch metrics."""
+    global _IMAGE_FETCH_DURATION, _IMAGE_FETCH_TOTAL
+    if _IMAGE_FETCH_DURATION is None or _IMAGE_FETCH_TOTAL is None:
+        _IMAGE_FETCH_DURATION = Histogram(
+            "vllm:mm_image_fetch_duration_seconds",
+            "Duration of fetching an image (download + decode) via "
+            "MediaConnector, labeled by source domain and status.",
+            labelnames=("domain", "status"),
+            buckets=(
+                0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0
+            ),
+        )
+        _IMAGE_FETCH_TOTAL = Counter(
+            "vllm:mm_image_fetch_total",
+            "Total image fetch attempts via MediaConnector, split by source "
+            "domain and status (success/error).",
+            labelnames=("domain", "status"),
+        )
+    return _IMAGE_FETCH_DURATION, _IMAGE_FETCH_TOTAL
 
 
 def _image_fetch_domain(url: str) -> str:
@@ -92,8 +111,9 @@ def _image_fetch_domain(url: str) -> str:
 
 def _observe_image_fetch(domain: str, elapsed: float, status: str) -> None:
     """Record latency and success/error count for a single image fetch."""
-    _IMAGE_FETCH_TOTAL.labels(domain, status).inc()
-    _IMAGE_FETCH_DURATION.labels(domain, status).observe(elapsed)
+    duration, total = _get_image_fetch_metrics()
+    total.labels(domain, status).inc()
+    duration.labels(domain, status).observe(elapsed)
 
 
 _M = TypeVar("_M")
