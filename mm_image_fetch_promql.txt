@@ -1,0 +1,100 @@
+================================================================================
+ vLLM 图片下载监控 PromQL 速查
+ 指标来源: vllm/multimodal/media/connector.py
+================================================================================
+
+可用指标
+--------------------------------------------------------------------------------
+1) vllm:mm_image_fetch_duration_seconds   (Histogram)
+   端到端耗时(download + cache + decode 全过程)，labels: domain, status
+2) vllm:mm_image_fetch_total              (Counter)
+   下载尝试总数，labels: domain, status(success|error)
+3) vllm:mm_image_fetch_stage_duration_seconds  (Histogram) ★新增
+   分阶段耗时，labels: domain, stage(download|decode)
+   - stage="download": 纯网络下载耗时(async I/O)
+   - stage="decode"  : 纯解码耗时(线程池, CPU 密集)
+   注意: 仅 async 路径(生产多模态请求)上报；缓存命中时只有 decode。
+
+
+================================================================================
+ 一、核心诉求: 区分"网络"耗时 vs "处理"耗时
+================================================================================
+
+# 网络下载 P50 (ms)
+histogram_quantile(0.50,
+  sum(rate(vllm:mm_image_fetch_stage_duration_seconds_bucket{stage="download"}[5m])) by (le, domain)
+) * 1000
+
+# 解码处理 P50 (ms)
+histogram_quantile(0.50,
+  sum(rate(vllm:mm_image_fetch_stage_duration_seconds_bucket{stage="decode"}[5m])) by (le, domain)
+) * 1000
+
+# 网络 P99 (ms) —— 看长尾/远端抖动
+histogram_quantile(0.99,
+  sum(rate(vllm:mm_image_fetch_stage_duration_seconds_bucket{stage="download"}[5m])) by (le, domain)
+) * 1000
+
+# 解码 P99 (ms) —— 看 CPU/线程池排队长尾
+histogram_quantile(0.99,
+  sum(rate(vllm:mm_image_fetch_stage_duration_seconds_bucket{stage="decode"}[5m])) by (le, domain)
+) * 1000
+
+# 网络 vs 处理 平均耗时占比 (一眼看出瓶颈在哪一侧)
+# download 平均耗时:
+sum(rate(vllm:mm_image_fetch_stage_duration_seconds_sum{stage="download"}[5m]))
+/ sum(rate(vllm:mm_image_fetch_stage_duration_seconds_count{stage="download"}[5m]))
+# decode 平均耗时:
+sum(rate(vllm:mm_image_fetch_stage_duration_seconds_sum{stage="decode"}[5m]))
+/ sum(rate(vllm:mm_image_fetch_stage_duration_seconds_count{stage="decode"}[5m]))
+
+
+================================================================================
+ 二、错误率与吞吐 (验证"流量是否真均匀")
+================================================================================
+
+# 每域名错误率
+sum(rate(vllm:mm_image_fetch_total{status="error"}[5m])) by (domain)
+/ sum(rate(vllm:mm_image_fetch_total[5m])) by (domain)
+
+# QPS 按 status 拆分 (成功/失败分开看，避免此消彼长被掩盖)
+sum(rate(vllm:mm_image_fetch_total[5m])) by (domain, status)
+
+
+================================================================================
+ 三、端到端耗时 (排除 error 污染，对照分阶段)
+================================================================================
+
+# 成功请求端到端 P50 (ms)
+histogram_quantile(0.50,
+  sum(rate(vllm:mm_image_fetch_duration_seconds_bucket{status="success"}[5m])) by (le, domain)
+) * 1000
+
+# 端到端 - (download + decode) 的差值 ≈ 缓存读写 + 线程池排队开销
+# 若该差值很大，说明瓶颈是线程池排队/磁盘缓存，而非网络或解码本身。
+
+
+================================================================================
+ 四、线程池容量判断 (配合 VLLM_MEDIA_LOADING_THREAD_COUNT 调优)
+================================================================================
+
+# 解码吞吐 (每秒完成的解码数)
+sum(rate(vllm:mm_image_fetch_stage_duration_seconds_count{stage="decode"}[5m])) by (domain)
+
+# 利特尔法则估算所需并发: 解码QPS × 解码平均耗时(s) = 需要的线程数下限
+(sum(rate(vllm:mm_image_fetch_stage_duration_seconds_count{stage="decode"}[5m])))
+*
+(sum(rate(vllm:mm_image_fetch_stage_duration_seconds_sum{stage="decode"}[5m]))
+ / sum(rate(vllm:mm_image_fetch_stage_duration_seconds_count{stage="decode"}[5m])))
+
+
+================================================================================
+ 诊断决策表
+================================================================================
+ download 涨 / decode 平  -> 网络或远端问题(限流/DNS/带宽)，与 CPU 无关
+ decode 涨 / download 平  -> CPU 或线程池排队，调 VLLM_MEDIA_LOADING_THREAD_COUNT
+ 两者都平 / 端到端涨       -> 线程池排队或磁盘缓存慢(看端到端与分阶段差值)
+ 错误率同步上涨            -> 成功率恶化，error 样本拖高端到端 P50
+================================================================================
+
+注: rate 窗口统一用 [5m]，避免 [1m] 在默认 15s 抓取间隔下分位数噪声过大。

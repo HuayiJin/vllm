@@ -72,6 +72,7 @@ _PLACEHOLDER_IMAGE_BYTES = _build_placeholder_image_bytes()
 # happens after that cleanup has run.
 _IMAGE_FETCH_DURATION: Histogram | None = None
 _IMAGE_FETCH_TOTAL: Counter | None = None
+_IMAGE_FETCH_STAGE_DURATION: Histogram | None = None
 
 
 def _get_image_fetch_metrics() -> tuple[Histogram, Counter]:
@@ -96,6 +97,34 @@ def _get_image_fetch_metrics() -> tuple[Histogram, Counter]:
     return _IMAGE_FETCH_DURATION, _IMAGE_FETCH_TOTAL
 
 
+def _get_image_fetch_stage_metric() -> Histogram:
+    """Lazily create and return the per-stage image-fetch latency metric.
+
+    Breaks the end-to-end ``vllm:mm_image_fetch_duration_seconds`` down into
+    distinct stages so that network time can be told apart from CPU decode
+    time:
+      stage="download" : time spent in the network fetch (async I/O)
+      stage="decode"   : time spent decoding the bytes into a PIL/array object
+                         on the shared media thread pool (CPU bound)
+    Only emitted on the async fetch path (``load_from_url_async``), which is
+    what production multimodal requests use. Created lazily for the same
+    reason as the other metrics above (registry cleanup on engine startup).
+    """
+    global _IMAGE_FETCH_STAGE_DURATION
+    if _IMAGE_FETCH_STAGE_DURATION is None:
+        _IMAGE_FETCH_STAGE_DURATION = Histogram(
+            "vllm:mm_image_fetch_stage_duration_seconds",
+            "Per-stage latency of fetching an image via MediaConnector, "
+            "labeled by source domain and stage (download/decode). Lets "
+            "network time be distinguished from CPU decode time.",
+            labelnames=("domain", "stage"),
+            buckets=(
+                0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0
+            ),
+        )
+    return _IMAGE_FETCH_STAGE_DURATION
+
+
 def _image_fetch_domain(url: str) -> str:
     """Best-effort extraction of the source domain for metric labels."""
     if url.startswith("data:"):
@@ -114,6 +143,11 @@ def _observe_image_fetch(domain: str, elapsed: float, status: str) -> None:
     duration, total = _get_image_fetch_metrics()
     total.labels(domain, status).inc()
     duration.labels(domain, status).observe(elapsed)
+
+
+def _observe_image_fetch_stage(domain: str, stage: str, elapsed: float) -> None:
+    """Record latency of a single image-fetch stage (download/decode)."""
+    _get_image_fetch_stage_metric().labels(domain, stage).observe(elapsed)
 
 
 _M = TypeVar("_M")
@@ -416,27 +450,44 @@ class MediaConnector:
         if url_spec.scheme and url_spec.scheme.startswith("http"):
             self._assert_url_in_allowed_media_domains(url_spec)
 
+            domain = _image_fetch_domain(url)
+
             cached = await loop.run_in_executor(
                 global_thread_pool, self._get_cached_bytes, url
             )
             if cached is not None:
+                # Cache hit: no network download, only decode.
+                decode_start = time.perf_counter()
                 future = loop.run_in_executor(
                     global_thread_pool, media_io.load_bytes, cached
                 )
-                return await future
+                result = await future
+                _observe_image_fetch_stage(
+                    domain, "decode", time.perf_counter() - decode_start
+                )
+                return result
 
             connection = self.connection
+            download_start = time.perf_counter()
             data = await connection.async_get_bytes(
                 url_spec.url,
                 timeout=fetch_timeout,
                 allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
             )
+            _observe_image_fetch_stage(
+                domain, "download", time.perf_counter() - download_start
+            )
 
             await loop.run_in_executor(
                 global_thread_pool, self._put_cached_bytes, url, data
             )
+            decode_start = time.perf_counter()
             future = loop.run_in_executor(global_thread_pool, media_io.load_bytes, data)
-            return await future
+            result = await future
+            _observe_image_fetch_stage(
+                domain, "decode", time.perf_counter() - decode_start
+            )
+            return result
 
         if url_spec.scheme == "data":
             future = loop.run_in_executor(
